@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# AprilTag localization (Part C) — Windows-stable + smooth preview
+# deps: pip install pupil-apriltags opencv-python numpy
+
+import argparse, json, math, csv, time
+from pathlib import Path
+import numpy as np
+import cv2 as cv
+import pupil_apriltags as apriltag
+
+# ---------- math helpers ----------
+def rotz(t):
+    c,s=np.cos(t),np.sin(t); return np.array([[c,-s,0],[s,c,0],[0,0,1]],float)
+def se3_inv(R,t): Rt=R.T; return Rt, -Rt@t
+def R_to_quat(R):
+    K=np.array([
+        [R[0,0]-R[1,1]-R[2,2], R[1,0]+R[0,1],        R[2,0]+R[0,2],        R[1,2]-R[2,1]],
+        [R[1,0]+R[0,1],        R[1,1]-R[0,0]-R[2,2], R[2,1]+R[1,2],        R[2,0]-R[0,2]],
+        [R[2,0]+R[0,2],        R[2,1]+R[1,2],        R[2,2]-R[0,0]-R[1,1], R[0,1]-R[1,0]],
+        [R[1,2]-R[2,1],        R[2,0]-R[0,2],        R[0,1]-R[1,0],        R[0,0]+R[1,1]+R[2,2]]
+    ],float)/3.0
+    w,V=np.linalg.eigh(K); q=V[:,np.argmax(w)]; return q[0],q[1],q[2],q[3]
+def average_rotations(Rs):
+    M=np.zeros((3,3)); 
+    for R in Rs: M+=R
+    U,_,Vt=np.linalg.svd(M); Rm=U@Vt
+    if np.linalg.det(Rm)<0: U[:,-1]*=-1; Rm=U@Vt
+    return Rm
+
+# ---------- world / drawing ----------
+def load_world(path):
+    cfg=json.load(open(path,"r"))
+    size=float(cfg["tag_size"]); tags={}
+    for k,v in cfg["tags"].items():
+        tid=int(k)
+        x,y,z=float(v["x"]),float(v["y"]),float(v["z"])
+        yaw=math.radians(float(v.get("yaw_deg",0.0)))
+        tags[tid]=(rotz(yaw), np.array([x,y,z],float).reshape(3,1))
+    return size, tags
+
+def draw_axes(img,K,dist,R_wc,t_wc,axis_len=0.05):
+    pts=np.float32([[0,0,0],[axis_len,0,0],[0,axis_len,0],[0,0,axis_len]])
+    R_cw,t_cw=R_wc.T, -R_wc.T@t_wc
+    rvec,_=cv.Rodrigues(R_cw); im,_=cv.projectPoints(pts,rvec,t_cw,K,dist)
+    im=im.reshape(-1,2).astype(int); o,x,y,z=im
+    cv.line(img,o,x,(0,0,255),2); cv.line(img,o,y,(0,255,0),2); cv.line(img,o,z,(255,0,0),2); return img
+
+def draw_dets(vis,dets,scale):
+    s=(1.0/scale) if scale!=1.0 else 1.0
+    for d in dets:
+        pts=(d.corners*s).astype(int)
+        for i in range(4): cv.line(vis,tuple(pts[i]),tuple(pts[(i+1)%4]),(0,255,255),2)
+        c=tuple((d.center*s).astype(int)); cv.circle(vis,c,3,(0,0,255),-1)
+        cv.putText(vis,str(int(d.tag_id)),c,cv.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+
+# ---------- camera ----------
+def open_cam(index, backend):
+    # force stable backends; set small buffer and 720p
+    if backend=="msmf":
+        cap=cv.VideoCapture(index, cv.CAP_MSMF)
+        if not cap.isOpened(): cap=cv.VideoCapture(index, cv.CAP_DSHOW)
+    elif backend=="dshow":
+        cap=cv.VideoCapture(index, cv.CAP_DSHOW)
+        if not cap.isOpened(): cap=cv.VideoCapture(index, cv.CAP_MSMF)
+    else:
+        cap=cv.VideoCapture(index, cv.CAP_MSMF)
+        if not cap.isOpened(): cap=cv.VideoCapture(index, cv.CAP_DSHOW)
+    if not cap.isOpened(): cap=cv.VideoCapture(index)
+    # reduce lag and resolution
+    try: cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+    except: pass
+    cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv.CAP_PROP_FPS, 30)
+    return cap
+
+# ---------- detection ----------
+def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.6):
+    fx,fy,cx,cy=K[0,0],K[1,1],K[0,2],K[1,2]
+    work_gray=gray
+    if scale!=1.0:
+        work_gray=cv.resize(gray,None,fx=scale,fy=scale,interpolation=cv.INTER_AREA)
+        fx,fy,cx,cy=fx*scale,fy*scale,cx*scale,cy*scale
+    D=detector.detect(work_gray,estimate_tag_pose=True,camera_params=(fx,fy,cx,cy),tag_size=tag_size)
+    Rl,Tl,ids=[],[],[]
+    for d in D:
+        tid=int(d.tag_id)
+        if tid not in world: continue
+        R_ct,t_ct=d.pose_R,d.pose_t          # tag in camera
+        R_tc,t_tc=se3_inv(R_ct,t_ct)          # camera in tag
+        R_wt,t_wt=world[tid]                  # tag in world
+        R_wc=R_wt@R_tc; t_wc=R_wt@t_tc+t_wt   # camera in world
+        Rl.append(R_wc); Tl.append(t_wc); ids.append(tid)
+    if not Rl: return None,None,[],D
+    R_wc=average_rotations(Rl); t_wc=np.mean(np.hstack(Tl),axis=1,keepdims=True)
+    return R_wc,t_wc,ids,D
+
+def main():
+    ap=argparse.ArgumentParser(description="AprilTag-based camera localization (Part C)")
+    ap.add_argument("--params", required=True)
+    ap.add_argument("--world", required=True)
+    g=ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--img"); g.add_argument("--cam", type=int)
+    ap.add_argument("--csv")
+    # NEW knobs:
+    ap.add_argument("--backend", choices=["msmf","dshow","auto"], default="dshow")  # dshow is usually least janky
+    ap.add_argument("--scale", type=float, default=0.5)                             # downscale for detection (speed)
+    ap.add_argument("--detect_every", type=int, default=3, help="run detection every N frames")
+    ap.add_argument("--family", default="tag36h11")
+
+    ap.add_argument("--threads", type=int, default=4, help="AprilTag detector threads")
+    args=ap.parse_args()
+
+    data=np.load(args.params); K,dist=data["K"],data["dist"]
+    tag_size,world=load_world(args.world)
+    detector=apriltag.Detector(families=args.family,nthreads=args.threads,refine_edges=True)
+
+    if args.img:
+        img=cv.imread(args.img,cv.IMREAD_COLOR)
+        if img is None: raise SystemExit("Could not read image: "+args.img)
+        gray=cv.cvtColor(img,cv.COLOR_BGR2GRAY)
+        R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale)
+        if R_wc is None: raise SystemExit("No known tags. Check IDs/family/size/world JSON.")
+        print("Used tag IDs:",ids); print("Camera position (m):",t_wc.ravel()); print("Quat (x,y,z,w):",R_to_quat(R_wc))
+        draw_dets(img,dets,args.scale); img=draw_axes(img,K,dist,R_wc,t_wc,0.05)
+        cv.imshow("pose",img); cv.waitKey(0); cv.destroyAllWindows(); return
+
+    cap=open_cam(args.cam,args.backend)
+    if not cap.isOpened(): raise SystemExit("Camera failed to open. Try --backend msmf or another --cam.")
+    writer=None
+    if args.csv:
+        p=Path(args.csv); p.parent.mkdir(parents=True,exist_ok=True)
+        writer=csv.writer(open(p,"w",newline="")); writer.writerow(["timestamp","x","y","z","qx","qy","qz","qw","num_tags"])
+
+    print("Press q to quit. space=detection on/off")
+    enable_detect=True
+    last_R,last_t,last_ids=[],None,None
+    f=0
+    while True:
+        # flush buffer a bit (reduces single-frame “stuck”)
+        ok, frame = cap.read()
+        if not ok:
+            print("Frame grab failed, stopping.")
+            break
+
+        vis=frame.copy()
+        gray=cv.cvtColor(frame,cv.COLOR_BGR2GRAY)
+        cv.putText(vis,f'frame mean:{gray.mean():.1f}',(10,55),cv.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
+
+        run_this_frame = enable_detect and (f % max(1, args.detect_every) == 0)
+        if run_this_frame:
+            R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale)
+            if R_wc is not None:
+                last_R,last_t,last_ids = R_wc,t_wc,ids
+            draw_dets(vis,dets,args.scale)
+
+        if last_t is not None:
+            vis=draw_axes(vis,K,dist,last_R,last_t,0.05)
+            qx,qy,qz,qw=R_to_quat(last_R)
+            cv.putText(vis,f"tags:{len(last_ids)}  x:{last_t[0,0]:.3f} y:{last_t[1,0]:.3f} z:{last_t[2,0]:.3f} m",
+                       (10,30),cv.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+            if writer and run_this_frame:
+                writer.writerow([time.time(),last_t[0,0],last_t[1,0],last_t[2,0],qx,qy,qz,qw,len(last_ids)])
+
+        cv.imshow("AprilTag localization", vis)
+        key=cv.waitKey(1)&0xFF
+        if key==ord('q'): break
+        if key==ord(' '): enable_detect = not enable_detect
+        f+=1
+
+    cap.release(); cv.destroyAllWindows()
+
+if __name__=="__main__": main()
