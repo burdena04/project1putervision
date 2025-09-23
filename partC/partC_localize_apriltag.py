@@ -27,6 +27,33 @@ def average_rotations(Rs):
     if np.linalg.det(Rm)<0: U[:,-1]*=-1; Rm=U@Vt
     return Rm
 
+def quat_to_R(qx,qy,qz,qw):
+    qx,qy,qz,qw = float(qx),float(qy),float(qz),float(qw)
+    n = math.sqrt(qx*qx+qy*qy+qz*qz+qw*qw)
+    if n == 0.0: return np.eye(3)
+    qx,qy,qz,qw = qx/n, qy/n, qz/n, qw/n
+    return np.array([
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1-2*(qx*qx+qy*qy)]
+    ], float)
+
+
+def blend_pose(prev_R, prev_t, new_R, new_t, alpha):
+    beta = float(np.clip(alpha, 0.0, 1.0))
+    if prev_R is None or prev_t is None or beta >= 0.999:
+        return new_R, new_t
+    if beta <= 0.001:
+        return prev_R, prev_t
+    prev_q = np.array(R_to_quat(prev_R))
+    new_q = np.array(R_to_quat(new_R))
+    if np.dot(prev_q, new_q) < 0: new_q = -new_q
+    q = (1.0-beta)*prev_q + beta*new_q
+    q /= np.linalg.norm(q)
+    R = quat_to_R(*q)
+    t = (1.0-beta)*prev_t + beta*new_t
+    return R, t
+
 # ---------- world / drawing ----------
 def load_world(path):
     cfg=json.load(open(path,"r"))
@@ -76,7 +103,7 @@ def open_cam(index, backend):
     return cap
 
 # ---------- detection ----------
-def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.6):
+def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.6,target_tag=None):
     fx,fy,cx,cy=K[0,0],K[1,1],K[0,2],K[1,2]
     work_gray=gray
     if scale!=1.0:
@@ -86,6 +113,7 @@ def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.6):
     Rl,Tl,ids=[],[],[]
     for d in D:
         tid=int(d.tag_id)
+        if target_tag is not None and tid != target_tag: continue
         if tid not in world: continue
         R_ct,t_ct=d.pose_R,d.pose_t          # tag in camera
         R_tc,t_tc=se3_inv(R_ct,t_ct)          # camera in tag
@@ -108,6 +136,9 @@ def main():
     ap.add_argument("--scale", type=float, default=0.5)                             # downscale for detection (speed)
     ap.add_argument("--detect_every", type=int, default=3, help="run detection every N frames")
     ap.add_argument("--family", default="tag36h11")
+    ap.add_argument("--only-tag", type=int, help="Restrict pose estimation to a single tag ID")
+    ap.add_argument("--pose-ema", type=float, default=1.0, help="EMA weight for new poses (1.0 disables smoothing)")
+    ap.add_argument("--draw-axes", action="store_true", help="Overlay XYZ axes for the camera pose")
 
     ap.add_argument("--threads", type=int, default=4, help="AprilTag detector threads")
     args=ap.parse_args()
@@ -120,10 +151,12 @@ def main():
         img=cv.imread(args.img,cv.IMREAD_COLOR)
         if img is None: raise SystemExit("Could not read image: "+args.img)
         gray=cv.cvtColor(img,cv.COLOR_BGR2GRAY)
-        R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale)
+        R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
         if R_wc is None: raise SystemExit("No known tags. Check IDs/family/size/world JSON.")
         print("Used tag IDs:",ids); print("Camera position (m):",t_wc.ravel()); print("Quat (x,y,z,w):",R_to_quat(R_wc))
-        draw_dets(img,dets,args.scale); img=draw_axes(img,K,dist,R_wc,t_wc,0.05)
+        draw_dets(img,dets,args.scale)
+        if args.draw_axes:
+            img=draw_axes(img,K,dist,R_wc,t_wc,0.05)
         cv.imshow("pose",img); cv.waitKey(0); cv.destroyAllWindows(); return
 
     cap=open_cam(args.cam,args.backend)
@@ -135,7 +168,8 @@ def main():
 
     print("Press q to quit. space=detection on/off")
     enable_detect=True
-    last_R,last_t,last_ids=[],None,None
+    last_R,last_t,last_ids=None,None,[]
+    pose_alpha=float(np.clip(args.pose_ema,0.0,1.0))
     f=0
     while True:
         # flush buffer a bit (reduces single-frame “stuck”)
@@ -150,13 +184,15 @@ def main():
 
         run_this_frame = enable_detect and (f % max(1, args.detect_every) == 0)
         if run_this_frame:
-            R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale)
+            R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
             if R_wc is not None:
-                last_R,last_t,last_ids = R_wc,t_wc,ids
+                last_R,last_t = blend_pose(last_R,last_t,R_wc,t_wc,pose_alpha)
+                last_ids = ids
             draw_dets(vis,dets,args.scale)
 
         if last_t is not None:
-            vis=draw_axes(vis,K,dist,last_R,last_t,0.05)
+            if args.draw_axes:
+                vis=draw_axes(vis,K,dist,last_R,last_t,0.05)
             qx,qy,qz,qw=R_to_quat(last_R)
             cv.putText(vis,f"tags:{len(last_ids)}  x:{last_t[0,0]:.3f} y:{last_t[1,0]:.3f} z:{last_t[2,0]:.3f} m",
                        (10,30),cv.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
