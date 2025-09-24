@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import cv2 as cv
 import pupil_apriltags as apriltag
+from datetime import datetime
 
 # ---------- math helpers ----------
 def rotz(t):
@@ -80,6 +81,17 @@ def draw_dets(vis,dets,scale):
         c=tuple((d.center*s).astype(int)); cv.circle(vis,c,3,(0,0,255),-1)
         cv.putText(vis,str(int(d.tag_id)),c,cv.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
 
+def has_distortion(dist):
+    if dist is None:
+        return False
+    dist = np.asarray(dist).ravel()
+    return dist.size > 0 and np.linalg.norm(dist) > 1e-9
+
+def zero_distortion_like(dist):
+    if dist is None:
+        return None
+    return np.zeros_like(dist)
+
 # ---------- camera ----------
 def open_cam(index, backend):
     # force stable backends; set small buffer and 720p
@@ -131,6 +143,7 @@ def main():
     g=ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--img"); g.add_argument("--cam", type=int)
     ap.add_argument("--csv")
+    ap.add_argument("--snapshot-dir")
     # NEW knobs:
     ap.add_argument("--backend", choices=["msmf","dshow","auto"], default="dshow")  # dshow is usually least janky
     ap.add_argument("--scale", type=float, default=0.5)                             # downscale for detection (speed)
@@ -139,29 +152,54 @@ def main():
     ap.add_argument("--only-tag", type=int, help="Restrict pose estimation to a single tag ID")
     ap.add_argument("--pose-ema", type=float, default=1.0, help="EMA weight for new poses (1.0 disables smoothing)")
     ap.add_argument("--draw-axes", action="store_true", help="Overlay XYZ axes for the camera pose")
+    ap.add_argument("--undistort-alpha", type=float, default=0.0, help="Alpha for cv.getOptimalNewCameraMatrix (0=crop,1=keep)")
 
     ap.add_argument("--threads", type=int, default=4, help="AprilTag detector threads")
     args=ap.parse_args()
 
-    data=np.load(args.params); K,dist=data["K"],data["dist"]
+    data=np.load(args.params)
+    K,dist=data["K"],data["dist"]
+    K=np.asarray(K,float)
+    dist=np.asarray(dist,float)
+    base_K = K.copy()
+    cam_K = base_K.copy()
     tag_size,world=load_world(args.world)
+    undistort_frames=has_distortion(dist)
+    zero_dist=zero_distortion_like(dist) if undistort_frames else dist
     detector=apriltag.Detector(families=args.family,nthreads=args.threads,refine_edges=True)
 
     if args.img:
         img=cv.imread(args.img,cv.IMREAD_COLOR)
         if img is None: raise SystemExit("Could not read image: "+args.img)
+        axes_dist = zero_dist
+        if undistort_frames:
+            h,w = img.shape[:2]
+            newK,_ = cv.getOptimalNewCameraMatrix(base_K,dist,(w,h),args.undistort_alpha,(w,h))
+            cam_K = newK
+            img=cv.undistort(img,base_K,dist,None,newK)
+            axes_dist = zero_dist
+        else:
+            cam_K = base_K
+            axes_dist = dist
         gray=cv.cvtColor(img,cv.COLOR_BGR2GRAY)
-        R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
+        R_wc,t_wc,ids,dets=detect_and_pose(gray,cam_K,zero_dist if undistort_frames else dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
         if R_wc is None: raise SystemExit("No known tags. Check IDs/family/size/world JSON.")
         print("Used tag IDs:",ids); print("Camera position (m):",t_wc.ravel()); print("Quat (x,y,z,w):",R_to_quat(R_wc))
         draw_dets(img,dets,args.scale)
         if args.draw_axes:
-            img=draw_axes(img,K,dist,R_wc,t_wc,0.05)
+            img=draw_axes(img,K,axes_dist,R_wc,t_wc,0.05)
         cv.imshow("pose",img); cv.waitKey(0); cv.destroyAllWindows(); return
 
     cap=open_cam(args.cam,args.backend)
     if not cap.isOpened(): raise SystemExit("Camera failed to open. Try --backend msmf or another --cam.")
+    axes_dist = zero_dist
+    map1 = map2 = None
     writer=None
+    snap_dir=None
+    if args.snapshot_dir:
+        snap_dir = Path(args.snapshot_dir)
+        snap_dir.mkdir(parents=True,exist_ok=True)
+    last_frame_ud=None
     if args.csv:
         p=Path(args.csv); p.parent.mkdir(parents=True,exist_ok=True)
         writer=csv.writer(open(p,"w",newline="")); writer.writerow(["timestamp","x","y","z","qx","qy","qz","qw","num_tags"])
@@ -178,13 +216,21 @@ def main():
             print("Frame grab failed, stopping.")
             break
 
-        vis=frame.copy()
-        gray=cv.cvtColor(frame,cv.COLOR_BGR2GRAY)
+        frame_ud=frame
+        if undistort_frames:
+            if map1 is None:
+                h,w=frame.shape[:2]
+                map1,map2=cv.initUndistortRectifyMap(K,dist,None,K,(w,h),cv.CV_32FC1)
+            frame_ud=cv.remap(frame,map1,map2,interpolation=cv.INTER_LINEAR)
+        vis=frame_ud.copy()
+        gray=cv.cvtColor(frame_ud,cv.COLOR_BGR2GRAY)
+        if args.snapshot_dir:
+            last_frame_ud = frame_ud.copy()
         cv.putText(vis,f'frame mean:{gray.mean():.1f}',(10,55),cv.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
 
         run_this_frame = enable_detect and (f % max(1, args.detect_every) == 0)
         if run_this_frame:
-            R_wc,t_wc,ids,dets=detect_and_pose(gray,K,dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
+            R_wc,t_wc,ids,dets=detect_and_pose(gray,cam_K,zero_dist if undistort_frames else dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
             if R_wc is not None:
                 last_R,last_t = blend_pose(last_R,last_t,R_wc,t_wc,pose_alpha)
                 last_ids = ids
@@ -192,7 +238,7 @@ def main():
 
         if last_t is not None:
             if args.draw_axes:
-                vis=draw_axes(vis,K,dist,last_R,last_t,0.05)
+                vis=draw_axes(vis,K,axes_dist,last_R,last_t,0.05)
             qx,qy,qz,qw=R_to_quat(last_R)
             cv.putText(vis,f"tags:{len(last_ids)}  x:{last_t[0,0]:.3f} y:{last_t[1,0]:.3f} z:{last_t[2,0]:.3f} m",
                        (10,30),cv.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
@@ -203,6 +249,24 @@ def main():
         key=cv.waitKey(1)&0xFF
         if key==ord('q'): break
         if key==ord(' '): enable_detect = not enable_detect
+        if key==ord('p') and snap_dir is not None and last_t is not None and last_frame_ud is not None:
+            ts=datetime.now().strftime('%Y%m%d_%H%M%S')
+            img_path=snap_dir / f'snapshot_{ts}.png'
+            pose_path=snap_dir / f'snapshot_{ts}.json'
+            cv.imwrite(str(img_path), last_frame_ud)
+            pose_info = {
+                'timestamp': time.time(),
+                'translation_m': [float(last_t[0,0]), float(last_t[1,0]), float(last_t[2,0])],
+                'quaternion_xyzw': list(R_to_quat(last_R)),
+                'used_tags': last_ids,
+                'params_file': args.params,
+                'world_file': args.world,
+                'frame_undistorted': bool(undistort_frames),
+                'undistort_alpha': float(args.undistort_alpha),
+                'cam_matrix': cam_K.tolist()
+            }
+            pose_path.write_text(json.dumps(pose_info, indent=2))
+            print(f"[snapshot] saved {img_path} and {pose_path}")
         f+=1
 
     cap.release(); cv.destroyAllWindows()

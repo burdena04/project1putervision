@@ -1,0 +1,22 @@
+{
+  "timestamp": 1758676207.3125503,
+  "translation_m": [
+    0.08908635455841969,
+    0.06940885366298208,
+    -0.8273663253506911
+  ],
+  "quaternion_xyzw": [
+    0.061093687108991025,
+    -0.23945356441627652,
+    0.015824544224402402,
+    -0.9688545482598815
+  ],
+  "used_tags": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "params_file": "partB/calib_out/intrinsics.npz",
+  "world_file": "partC/world_tags_custom.json"
+}

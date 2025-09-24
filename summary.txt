@@ -1,0 +1,63 @@
+calibration snapshot (part b)
+- capture set: 20 imgs (cb_000.png - cb_019.png)
+- checkerboard: 7x10 inner corners, square size 0.024 m
+- image size: 640 x 480
+
+intrinsics K
+[556.384224  0.000000 322.287986]
+[ 0.000000 559.571429 217.312407]
+[ 0.000000  0.000000  1.000000]
+
+distortion (k1 k2 p1 p2 k3 k4 k5 k6 ...)
+[-1.099792 -13.672486 -0.000011 -0.004210 -4.027404 -0.816716 -13.902806 -8.512448]
+
+mean reprojection error: 0.197935 px
+per-image reprojection error
+cb_000.png: 0.131041
+cb_001.png: 0.136971
+cb_002.png: 0.133766
+cb_003.png: 0.233324
+cb_004.png: 0.230169
+cb_005.png: 0.234246
+cb_006.png: 0.222596
+cb_007.png: 0.212333
+cb_008.png: 0.187282
+cb_009.png: 0.196793
+cb_010.png: 0.190903
+cb_011.png: 0.213790
+cb_012.png: 0.228295
+cb_013.png: 0.227936
+cb_014.png: 0.223680
+cb_015.png: 0.215271
+cb_016.png: 0.148200
+cb_017.png: 0.151631
+cb_018.png: 0.155965
+cb_019.png: 0.284509
+
+part c runtime defaults
+- params: partB/calib_out/intrinsics.npz
+- world: partC/world_tags_custom.json
+- cmd uses undistort + scale 0.6, detect_every 1, pose-ema 1.0
+- add --csv logs/pose_snapshot.csv + --snapshot-dir logs/snapshots (press `p` to save pose-tagged frame)
+- adjust --undistort-alpha (0.0 crop, 0.5 wall view, 1.0 keep full FOV)
+
+wall tag layout (measured)
+- AprilTag edge: 0.068000 m
+- Tag 0 @ (0.000000, 0.000000, 0.000000) m
+- Tag 1 @ (0.164000, 0.000000, 0.000000) m
+- Tag 3 @ (0.164000, 0.222000, 0.000000) m
+- Tag 2 @ (-0.173000, 0.200000, 0.000000) m
+- yaw_deg = 0 for all (flush to wall)
+- stored in partC/world_tags_custom.json
+
+pose snapshot (2025-09-23)
+- translation (x,y,z) = (-0.025, 0.019, -0.381) m
+- notes: camera ~0.38 m off wall, slight left/up offset (pre-scale; rerun snapshot after RMSE capture)
+
+validation checklist (ruler 0.155 x 0.035 x 0.01 m)
+- capture snapshot with pipeline (press `p`)
+- run measure script for each edge:
+  * `--gt 0.155` (long edge)
+  * `--gt 0.035` (short edge)
+  * `--gt 0.010` (thickness, if flush)
+- log measured length + percent error here after capture
