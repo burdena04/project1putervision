@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # AprilTag localization (Part C) — Windows-stable + smooth preview
 # deps: pip install pupil-apriltags opencv-python numpy
 
@@ -74,13 +73,31 @@ def draw_axes(img,K,dist,R_wc,t_wc,axis_len=0.05):
     cv.line(img,o,x,(0,0,255),2); cv.line(img,o,y,(0,255,0),2); cv.line(img,o,z,(255,0,0),2); return img
 
 def draw_dets(vis,dets,scale):
-    s=(1.0/scale) if scale!=1.0 else 1.0
+    s = (1.0/scale) if scale!=1.0 else 1.0
     for d in dets:
-        pts=(d.corners*s).astype(int)
-        for i in range(4): cv.line(vis,tuple(pts[i]),tuple(pts[(i+1)%4]),(0,255,255),2)
-        c=tuple((d.center*s).astype(int)); cv.circle(vis,c,3,(0,0,255),-1)
-        cv.putText(vis,str(int(d.tag_id)),c,cv.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
-
+        if hasattr(d, "corners"):
+            corners = d.corners
+            center = d.center
+            tag_id = int(d.tag_id)
+        else:
+            corners = d["corners"]
+            center = d["center"]
+            tag_id = int(d["id"])
+        pts = (corners*s).astype(int)
+        for i in range(4):
+            cv.line(vis,tuple(pts[i]),tuple(pts[(i+1)%4]),(0,255,255),2)
+        c = tuple((center*s).astype(int))
+        cv.circle(vis,c,3,(0,0,255),-1)
+        cv.putText(vis,str(tag_id),c,cv.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+def freeze_detections(dets):
+    frozen = []
+    for d in dets:
+        frozen.append({
+            "id": int(d.tag_id),
+            "corners": d.corners.copy(),
+            "center": d.center.copy(),
+        })
+    return frozen
 def has_distortion(dist):
     if dist is None:
         return False
@@ -115,27 +132,46 @@ def open_cam(index, backend):
     return cap
 
 # ---------- detection ----------
-def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.6,target_tag=None):
-    fx,fy,cx,cy=K[0,0],K[1,1],K[0,2],K[1,2]
-    work_gray=gray
-    if scale!=1.0:
-        work_gray=cv.resize(gray,None,fx=scale,fy=scale,interpolation=cv.INTER_AREA)
-        fx,fy,cx,cy=fx*scale,fy*scale,cx*scale,cy*scale
-    D=detector.detect(work_gray,estimate_tag_pose=True,camera_params=(fx,fy,cx,cy),tag_size=tag_size)
-    Rl,Tl,ids=[],[],[]
-    for d in D:
-        tid=int(d.tag_id)
-        if target_tag is not None and tid != target_tag: continue
-        if tid not in world: continue
-        R_ct,t_ct=d.pose_R,d.pose_t          # tag in camera
-        R_tc,t_tc=se3_inv(R_ct,t_ct)          # camera in tag
-        R_wt,t_wt=world[tid]                  # tag in world
-        R_wc=R_wt@R_tc; t_wc=R_wt@t_tc+t_wt   # camera in world
-        Rl.append(R_wc); Tl.append(t_wc); ids.append(tid)
-    if not Rl: return None,None,[],D
-    R_wc=average_rotations(Rl); t_wc=np.mean(np.hstack(Tl),axis=1,keepdims=True)
-    return R_wc,t_wc,ids,D
-
+def detect_and_pose(gray,K,dist,tag_size,world,detector,scale=0.35,target_tag=None,blur_ksize=0):
+    fx,fy,cx,cy = K[0,0], K[1,1], K[0,2], K[1,2]
+    work_gray = gray
+    if scale != 1.0:
+        work_gray = cv.resize(gray, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+        fx *= scale
+        fy *= scale
+        cx *= scale
+        cy *= scale
+    cam_K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=float)
+    if blur_ksize and blur_ksize >= 3 and blur_ksize % 2 == 1:
+        work_gray = cv.GaussianBlur(work_gray, (blur_ksize, blur_ksize), 0)
+    detections = detector.detect(work_gray, estimate_tag_pose=False)
+    object_pts = []
+    image_pts = []
+    ids = []
+    for det in detections:
+        tid = int(det.tag_id)
+        if target_tag is not None and tid != target_tag:
+            continue
+        if tid not in world:
+            continue
+        R_wt, t_wt = world[tid]
+        obj = t_wt.reshape(3)
+        object_pts.append(obj)
+        ctr = det.center.astype(float)
+        image_pts.append(ctr)
+        ids.append(tid)
+    if len(object_pts) < 3:
+        return None, None, ids, detections
+    object_pts = np.array(object_pts, dtype=float).reshape(-1, 3)
+    image_pts = np.array(image_pts, dtype=float).reshape(-1, 1, 2)
+    ok, rvec, tvec = cv.solvePnP(object_pts, image_pts, cam_K, dist)
+    if not ok:
+        return None, None, ids, detections
+    R_co, _ = cv.Rodrigues(rvec)
+    t_co = tvec.reshape(3, 1)
+    R_wc = R_co.T
+    t_wc = -R_wc @ t_co
+    return R_wc, t_wc, ids, detections
 def main():
     ap=argparse.ArgumentParser(description="AprilTag-based camera localization (Part C)")
     ap.add_argument("--params", required=True)
@@ -146,14 +182,15 @@ def main():
     ap.add_argument("--snapshot-dir")
     # NEW knobs:
     ap.add_argument("--backend", choices=["msmf","dshow","auto"], default="dshow")  # dshow is usually least janky
-    ap.add_argument("--scale", type=float, default=0.5)                             # downscale for detection (speed)
-    ap.add_argument("--detect_every", type=int, default=3, help="run detection every N frames")
+    ap.add_argument("--scale", type=float, default=0.35, help="downscale factor for AprilTag detector")
+    ap.add_argument("--detect_every", type=int, default=2, help="run detection every N frames")
     ap.add_argument("--family", default="tag36h11")
     ap.add_argument("--only-tag", type=int, help="Restrict pose estimation to a single tag ID")
-    ap.add_argument("--pose-ema", type=float, default=1.0, help="EMA weight for new poses (1.0 disables smoothing)")
+    ap.add_argument("--pose-ema", type=float, default=0.6, help="EMA weight for new poses (1.0 disables smoothing)")
     ap.add_argument("--draw-axes", action="store_true", help="Overlay XYZ axes for the camera pose")
     ap.add_argument("--undistort-alpha", type=float, default=0.0, help="Alpha for cv.getOptimalNewCameraMatrix (0=crop,1=keep)")
 
+    ap.add_argument("--pre-blur", type=int, default=3, help="odd kernel size for Gaussian blur (0 disables)")
     ap.add_argument("--threads", type=int, default=4, help="AprilTag detector threads")
     args=ap.parse_args()
 
@@ -166,6 +203,7 @@ def main():
     tag_size,world=load_world(args.world)
     undistort_frames=has_distortion(dist)
     zero_dist=zero_distortion_like(dist) if undistort_frames else dist
+    blur_k = args.pre_blur if args.pre_blur and args.pre_blur >= 3 and (args.pre_blur % 2 == 1) else 0
     detector=apriltag.Detector(families=args.family,nthreads=args.threads,refine_edges=True)
 
     if args.img:
@@ -182,8 +220,11 @@ def main():
             cam_K = base_K
             axes_dist = dist
         gray=cv.cvtColor(img,cv.COLOR_BGR2GRAY)
-        R_wc,t_wc,ids,dets=detect_and_pose(gray,cam_K,zero_dist if undistort_frames else dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
-        if R_wc is None: raise SystemExit("No known tags. Check IDs/family/size/world JSON.")
+        R_wc,t_wc,ids,dets=detect_and_pose(gray,cam_K,zero_dist if undistort_frames else dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag, blur_ksize=blur_k)
+        if R_wc is None:
+            if ids:
+                raise SystemExit(f"Need at least 3 known tags for solvePnP (saw {len(ids)}: {ids}).")
+            raise SystemExit("No known tags. Check IDs/family/size/world JSON.")
         print("Used tag IDs:",ids); print("Camera position (m):",t_wc.ravel()); print("Quat (x,y,z,w):",R_to_quat(R_wc))
         draw_dets(img,dets,args.scale)
         if args.draw_axes:
@@ -207,6 +248,7 @@ def main():
     print("Press q to quit. space=detection on/off")
     enable_detect=True
     last_R,last_t,last_ids=None,None,[]
+    last_dets = []
     pose_alpha=float(np.clip(args.pose_ema,0.0,1.0))
     f=0
     while True:
@@ -229,13 +271,30 @@ def main():
         cv.putText(vis,f'frame mean:{gray.mean():.1f}',(10,55),cv.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
 
         run_this_frame = enable_detect and (f % max(1, args.detect_every) == 0)
+        dets_to_draw = last_dets if (not run_this_frame and last_dets) else []
         if run_this_frame:
-            R_wc,t_wc,ids,dets=detect_and_pose(gray,cam_K,zero_dist if undistort_frames else dist,tag_size,world,detector,scale=args.scale,target_tag=args.only_tag)
+            R_wc,t_wc,ids,dets=detect_and_pose(
+                gray,
+                cam_K,
+                zero_dist if undistort_frames else dist,
+                tag_size,
+                world,
+                detector,
+                scale=args.scale,
+                target_tag=args.only_tag,
+                blur_ksize=blur_k
+            )
+            if dets:
+                last_dets = freeze_detections(dets)
+                dets_to_draw = last_dets
+            else:
+                last_dets = []
+                dets_to_draw = []
             if R_wc is not None:
                 last_R,last_t = blend_pose(last_R,last_t,R_wc,t_wc,pose_alpha)
                 last_ids = ids
-            draw_dets(vis,dets,args.scale)
-
+        if dets_to_draw:
+            draw_dets(vis,dets_to_draw,args.scale)
         if last_t is not None:
             if args.draw_axes:
                 vis=draw_axes(vis,K,axes_dist,last_R,last_t,0.05)

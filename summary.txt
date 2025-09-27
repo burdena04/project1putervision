@@ -1,63 +1,69 @@
-calibration snapshot (part b)
+part a camera fundamentals
+- Ran python tools/cam_sanity.py --cam 0 --stream --show-hist to verify live feed and log pixel statistics (RGB means and HSV histogram).
+- Saved sample frame at logs/cam_sanity_frame.png.
+
+calibration log (part b)
+
+2025-03-?? baseline (640x480)
 - capture set: 20 imgs (cb_000.png - cb_019.png)
 - checkerboard: 7x10 inner corners, square size 0.024 m
 - image size: 640 x 480
+- K:
+  [556.384224 0.000000 322.287986]
+  [0.000000 559.571429 217.312407]
+  [0.000000 0.000000   1.000000]
+- distortion:
+  [-1.099792 -13.672486 -0.000011 -0.004210 -4.027404 -0.816716 -13.902806 -8.512448]
+- mean reprojection error: 0.198 px (per-image list archived in git history)
 
-intrinsics K
-[556.384224  0.000000 322.287986]
-[ 0.000000 559.571429 217.312407]
-[ 0.000000  0.000000  1.000000]
+2025-09-26 calibration (1920x1080)
+- capture set: 15 imgs (cb_000.png - cb_014.png)
+- checkerboard: 7x10 inner corners, square size 0.024 m
+- image size: 1920 x 1080
+- K:
+  [1421.957171 0.000000 936.169342]
+  [0.000000 1438.840645 518.871785]
+  [0.000000 0.000000 1.000000]
+- distortion (k1..k5): [-0.19108, -69.93706, -0.00515, 0.00376, -45.95566]
+- mean reprojection error: 0.384 px
+- undistorted previews/exports visually OK (covers frame better than prior run)
 
-distortion (k1 k2 p1 p2 k3 k4 k5 k6 ...)
-[-1.099792 -13.672486 -0.000011 -0.004210 -4.027404 -0.816716 -13.902806 -8.512448]
+per-image reprojection error (px)
+cb_000.png: 0.456
+cb_001.png: 0.460
+cb_002.png: 0.448
+cb_003.png: 0.453
+cb_004.png: 0.219
+cb_005.png: 0.489
+cb_006.png: 0.354
+cb_007.png: 0.427
+cb_008.png: 0.400
+cb_009.png: 0.433
+cb_010.png: 0.333
+cb_011.png: 0.436
+cb_012.png: 0.286
+cb_013.png: 0.283
+cb_014.png: 0.286
 
-mean reprojection error: 0.197935 px
-per-image reprojection error
-cb_000.png: 0.131041
-cb_001.png: 0.136971
-cb_002.png: 0.133766
-cb_003.png: 0.233324
-cb_004.png: 0.230169
-cb_005.png: 0.234246
-cb_006.png: 0.222596
-cb_007.png: 0.212333
-cb_008.png: 0.187282
-cb_009.png: 0.196793
-cb_010.png: 0.190903
-cb_011.png: 0.213790
-cb_012.png: 0.228295
-cb_013.png: 0.227936
-cb_014.png: 0.223680
-cb_015.png: 0.215271
-cb_016.png: 0.148200
-cb_017.png: 0.151631
-cb_018.png: 0.155965
-cb_019.png: 0.284509
+april tag board & pose pipeline
+- AprilTag board: four tag36h11 IDs {0,1,2,3}; tag_size 0.067 m; centers at (0,0), (0.20,0), (0,0.20), (0.20,0.20) m (all z = 0).
+- Pose viewer command (Part C):
+  python partC/partC_localize_apriltag.py --params partB/calib_out/intrinsics.npz --world partC/world_tags_custom.json --cam 0 --backend dshow --scale 0.35 --detect_every 2 --pose-ema 0.6 --undistort-alpha 0.0 --pre-blur 3 --csv logs/pose_snapshot.csv --snapshot-dir logs/snapshots
+- Live pipeline (Part D):
+  python partD/partD_full_pipeline.py --params partB/calib_out/intrinsics.npz --world partC/world_tags_custom.json --cam 0 --backend dshow --alpha 0.0 --scale 0.35 --detect-every 2 --pose-ema 0.6 --pre-blur 3 --draw-axes --log logs/partd_pose.csv
+- Manual pose helper: python partC/manual_tag_pose.py --params partB/calib_out/intrinsics.npz --world partC/world_tags_custom.json --img SNAPSHOT.png --undistort --out-json manual_pose.json
 
-part c runtime defaults
-- params: partB/calib_out/intrinsics.npz
-- world: partC/world_tags_custom.json
-- cmd uses undistort + scale 0.6, detect_every 1, pose-ema 1.0
-- add --csv logs/pose_snapshot.csv + --snapshot-dir logs/snapshots (press `p` to save pose-tagged frame)
-- adjust --undistort-alpha (0.0 crop, 0.5 wall view, 1.0 keep full FOV)
+object measurement summary (snapshot_20250926_193821)
+- Measured inside tag array using measure_wall_object.py with pose JSON + PNG.
+- Horizontal edge: ground truth 0.083 m (object width); measured 0.079 m -> error -0.004 m (-4.8 percent).
+- Vertical edge: ground truth 0.068 m (object height); measured 0.0649 m -> error -0.0031 m (-4.52 percent).
+- Board spacing validation: 0.20 m center-to-center (world file scaled via measurement tool).
+- Residual error decreases when clicking precisely on object corners; keep blur low and ensure all four tags remain in view.
 
-wall tag layout (measured)
-- AprilTag edge: 0.068000 m
-- Tag 0 @ (0.000000, 0.000000, 0.000000) m
-- Tag 1 @ (0.164000, 0.000000, 0.000000) m
-- Tag 3 @ (0.164000, 0.222000, 0.000000) m
-- Tag 2 @ (-0.173000, 0.200000, 0.000000) m
-- yaw_deg = 0 for all (flush to wall)
-- stored in partC/world_tags_custom.json
+notes / next actions
+- Capture final dataset using the Part D pipeline while logging logs/partd_pose.csv.
+- Document object measurements (ground truth, measured value, percent error) in the final report per rubric.
+- If tighter accuracy is required, grab a fresh snapshot and re-run measure_wall_object.py --update-world using a verified reference edge, then remeasure the object.
 
-pose snapshot (2025-09-23)
-- translation (x,y,z) = (-0.025, 0.019, -0.381) m
-- notes: camera ~0.38 m off wall, slight left/up offset (pre-scale; rerun snapshot after RMSE capture)
-
-validation checklist (ruler 0.155 x 0.035 x 0.01 m)
-- capture snapshot with pipeline (press `p`)
-- run measure script for each edge:
-  * `--gt 0.155` (long edge)
-  * `--gt 0.035` (short edge)
-  * `--gt 0.010` (thickness, if flush)
-- log measured length + percent error here after capture
+final still-image pipeline
+- Use python partC/final_snapshot_pipeline.py --pose-json SNAPSHOT.json --img SNAPSHOT.png --gt <ground truth> [--out-image overlay.png] to capture final measurements from a saved still frame.

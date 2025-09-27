@@ -11,20 +11,27 @@ def main():
     ap.add_argument("--rows", type=int, default=6, help="inner corners per column (rows)")
     ap.add_argument("--cols", type=int, default=9, help="inner corners per row (cols)")
     ap.add_argument("--interval", type=float, default=0.5, help="min seconds between saves")
+    ap.add_argument("--width", type=int, default=1920, help="capture width in pixels")
+    ap.add_argument("--height", type=int, default=1080, help="capture height in pixels")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     cap = cv.VideoCapture(args.cam, cv.CAP_DSHOW)
     if not cap.isOpened():
         raise SystemExit("Camera failed to open. Try a different --cam index.")
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
 
     pattern_size = (args.cols, args.rows)
     last_save = 0.0
     count = 0
+    actual_width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    print(f"Camera streaming at {actual_width}x{actual_height}")
     print(textwrap.dedent(f"""
         Controls:
           s : save current frame (only if pattern is confidently found)
-          g : force save (even if corners not found) — use sparingly
+          g : force save (even if corners not found) -- use sparingly
           q : quit
         Hint: vary angle, distance, position; fill different parts of the image.
     """))

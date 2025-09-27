@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # projectOnePartBCalibrate_min.py
 # Minimal, robust calibration script (no fancy formatting)
 
@@ -42,6 +41,7 @@ def main():
     ap.add_argument("--out", default="calib_out", help="output directory")
     ap.add_argument("--use_sb", action="store_true", help="prefer SB detector")
     ap.add_argument("--preview", action="store_true", help="show quick undistort previews")
+    ap.add_argument("--undistort-dir", help="optional directory to save undistorted images")
     args = ap.parse_args()
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -71,7 +71,7 @@ def main():
         used_files.append(f)
 
     if len(objpoints) < 8:
-        raise SystemExit("Too few valid images (" + str(len(objpoints)) + "). Capture 15–30 varied views.")
+        raise SystemExit("Too few valid images (" + str(len(objpoints)) + "). Capture 15â€“30 varied views.")
 
     h, w = cv.imread(used_files[0]).shape[:2]
     ret, K, dist, rvecs, tvecs = cv.calibrateCamera(
@@ -79,6 +79,11 @@ def main():
     )
 
     per_img, mean_err = rms_errors(objpoints, imgpoints, rvecs, tvecs, K, dist)
+    need_undistort = bool(args.undistort_dir or args.preview)
+    if need_undistort:
+        newK, _ = cv.getOptimalNewCameraMatrix(K, dist, (w, h), 1.0, (w, h))
+    else:
+        newK = None
 
     # save outputs
     np.savez(os.path.join(args.out, "intrinsics.npz"), K=K, dist=dist, image_size=(w,h))
@@ -105,9 +110,17 @@ def main():
     print("dist =", dist.reshape(-1))
     print("Mean reprojection error:", round(mean_err, 6), "px")
     print("Saved:", os.path.join(args.out, "intrinsics.npz"), "and report.json/intrinsics.txt")
+    if args.undistort_dir:
+        undist_dir = Path(args.undistort_dir)
+        undist_dir.mkdir(parents=True, exist_ok=True)
+        for src in used_files:
+            img = cv.imread(src)
+            und = cv.undistort(img, K, dist, None, newK if newK is not None else K)
+            out_path = undist_dir / (Path(src).stem + "_undist.png")
+            cv.imwrite(str(out_path), und)
+        print("Saved undistorted images to", undist_dir)
 
     if args.preview:
-        newK, _ = cv.getOptimalNewCameraMatrix(K, dist, (w,h), 1.0, (w,h))
         for f in used_files[:min(4, len(used_files))]:
             img = cv.imread(f)
             und = cv.undistort(img, K, dist, None, newK)

@@ -1,4 +1,4 @@
-# partA_min.py — meets Part A, minimal features, external webcam (index 1)
+# partA_min.py â€” meets Part A, minimal features, external webcam (index 1)
 # keys: c = mosaic toggle, s = save PNG/JPEGs, p = pixel probe, q/ESC = quit
 
 import cv2 as cv
@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 
 OUT_DIR = "partA_outputs"
-CAM_INDEX = 1  # external webcam; change to 0 if you want the laptop cam
+CAM_INDEX = 0  # external webcam; change to 0 if you want the laptop cam
 
 def ensure_dir(path): os.makedirs(path, exist_ok=True)
 
@@ -83,7 +83,7 @@ def open_cam(idx):
 
 def main():
     cap = open_cam(CAM_INDEX)
-    win = "Part A — Live (c mosaic, s=save PNG, j=save JPG, p probe, q quit)"
+    win = "Part A â€” Live (c mosaic, s=save PNG, j=save JPG, p probe, q quit)"
     cv.namedWindow(win, cv.WINDOW_NORMAL)
 
     probe = PixelProbe()
